@@ -4,6 +4,7 @@ const {
     DisconnectReason,
     downloadMediaMessage,
     normalizeMessageContent,
+    proto,
 } = require('@whiskeysockets/baileys');
 const authStore = require('./mysqlAuthState');
 const qrcode = require('qrcode-terminal');
@@ -242,12 +243,13 @@ function forwardToLaravel(payload, label = payload.event || 'event', timeout = 4
                 resolve(null);
             }
         });
+
     });
 }
 
 // ── Media ──
 const MAX_MEDIA_BYTES = 25 * 1024 * 1024; // don't base64 anything bigger than this
-const MEDIA_TYPES = ['image', 'video', 'audio', 'document'];
+const MEDIA_TYPES = ['image', 'video', 'audio', 'document', 'sticker', 'contact'];
 
 const silentLogger = {
     level: 'silent',
@@ -255,12 +257,123 @@ const silentLogger = {
     child() { return silentLogger; },
 };
 
-/** Return { mediaType, node } if the (already unwrapped) message content is image/video/audio/document. */
+/**
+ * Parse a single vCard 3.0 string into { name, phone, phones, vcard }.
+ */
+function parseVcardString(rawVcard, fallbackName = null) {
+    const vcard = String(rawVcard || '').trim();
+    let name = String(fallbackName || '').trim();
+
+    if (!name && vcard) {
+        const fnMatch = vcard.match(/^FN(?:;[^:]*)?:(.+)$/im);
+        if (fnMatch && fnMatch[1]) {
+            name = fnMatch[1].trim();
+        } else {
+            const nMatch = vcard.match(/^N(?:;[^:]*)?:([^;\r\n]*);([^;\r\n]*)/im);
+            if (nMatch) {
+                name = `${(nMatch[2] || '').trim()} ${(nMatch[1] || '').trim()}`.trim();
+            }
+        }
+    }
+
+    const phones = [];
+    if (vcard) {
+        const lines = vcard.split(/\r?\n/);
+        for (const line of lines) {
+            if (!/^(?:item\d+\.)?TEL/i.test(line)) continue;
+            const waidMatch = line.match(/waid=(\d+)/i);
+            const valuePart = line.includes(':') ? line.split(':').slice(1).join(':').trim() : '';
+            const rawDigits = waidMatch?.[1] || valuePart.replace(/\D/g, '');
+            if (rawDigits) {
+                const formatted = `+${rawDigits}`;
+                if (!phones.includes(formatted)) {
+                    phones.push(formatted);
+                }
+            } else if (valuePart && !phones.includes(valuePart)) {
+                phones.push(valuePart);
+            }
+        }
+    }
+
+    return {
+        name: name || phones[0] || 'Contact',
+        phone: phones[0] || '',
+        phones,
+        vcard,
+    };
+}
+
+/**
+ * Extract contact card(s) if the unwrapped message is contactMessage or contactsArrayMessage.
+ */
+function extractIncomingContacts(content) {
+    if (content?.contactMessage) {
+        const node = content.contactMessage;
+        const parsed = parseVcardString(node.vcard, node.displayName);
+        return {
+            contacts: [parsed],
+            displayName: parsed.name,
+            contextInfo: node.contextInfo || null,
+        };
+    }
+
+    if (content?.contactsArrayMessage) {
+        const node = content.contactsArrayMessage;
+        const rawList = Array.isArray(node.contacts) ? node.contacts : [];
+        const contacts = rawList
+            .map(c => parseVcardString(c?.vcard, c?.displayName))
+            .filter(c => c.name || c.phone || c.vcard);
+
+        if (contacts.length === 0) return null;
+        return {
+            contacts,
+            displayName: node.displayName || contacts[0]?.name || 'Contacts',
+            contextInfo: node.contextInfo || null,
+        };
+    }
+
+    return null;
+}
+
+/**
+ * Build a WhatsApp-compatible vCard 3.0 string from { name, phone, vcard? }.
+ */
+function buildVcardString(contactObj = {}) {
+    if (contactObj?.vcard && /BEGIN:VCARD/i.test(String(contactObj.vcard))) {
+        return String(contactObj.vcard).trim();
+    }
+
+    const cleanName = String(contactObj?.name || contactObj?.displayName || 'Contact').replace(/[\r\n]+/g, ' ').trim() || 'Contact';
+    let digits = String(contactObj?.phone || '').replace(/\D/g, '');
+    if (digits.length === 11 && digits.startsWith('01')) {
+        digits = `2${digits}`;
+    } else if (digits.startsWith('00') && digits.length > 4) {
+        digits = digits.slice(2);
+    }
+    const displayPhone = digits ? `+${digits}` : String(contactObj?.phone || '').trim();
+
+    const lines = [
+        'BEGIN:VCARD',
+        'VERSION:3.0',
+        `FN:${cleanName}`,
+        `N:;${cleanName};;;`,
+    ];
+    if (digits) {
+        lines.push(`TEL;type=CELL;type=VOICE;waid=${digits}:${displayPhone}`);
+    } else if (displayPhone) {
+        lines.push(`TEL;type=CELL:${displayPhone}`);
+    }
+    lines.push('END:VCARD');
+    return lines.join('\n');
+}
+
+/** Return { mediaType, node } if the (already unwrapped) message content is image/video/audio/document/sticker. */
 function detectIncomingMedia(content) {
     if (content?.imageMessage) return { mediaType: 'image', node: content.imageMessage };
     if (content?.videoMessage) return { mediaType: 'video', node: content.videoMessage };
     if (content?.audioMessage) return { mediaType: 'audio', node: content.audioMessage };
     if (content?.documentMessage) return { mediaType: 'document', node: content.documentMessage };
+    if (content?.stickerMessage) return { mediaType: 'sticker', node: content.stickerMessage };
     return null;
 }
 
@@ -300,6 +413,7 @@ function defaultMimetype(mediaType, isVoiceNote) {
     if (mediaType === 'audio') return isVoiceNote ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
     if (mediaType === 'video') return 'video/mp4';
     if (mediaType === 'image') return 'image/jpeg';
+    if (mediaType === 'sticker') return 'image/webp';
     return 'application/octet-stream';
 }
 
@@ -397,6 +511,10 @@ class LRUCache {
         return this.get(key) !== undefined;
     }
 
+    del(key) {
+        return this.cache.delete(key);
+    }
+
     delete(key) {
         return this.cache.delete(key);
     }
@@ -421,8 +539,8 @@ class LRUCache {
 
 // ── Presence & Profile Picture Caches ──
 const PRESENCE_RESUBSCRIBE_MS = 10 * 60 * 1000;
-const presenceSubscriptions = new LRUCache(2000, PRESENCE_RESUBSCRIBE_MS);
-const lastForwardedPresence = new LRUCache(2000, 10000);
+const presenceSubscriptions = new LRUCache(1000, PRESENCE_RESUBSCRIBE_MS);
+const lastForwardedPresence = new LRUCache(1000, 10000);
 
 async function subscribeToPresence(targetSock, jid, userId = 'default') {
     if (!targetSock) return;
@@ -446,8 +564,9 @@ const isJidIgnored = (jid) => {
 
 const AVATAR_TTL_FOUND_MS = 60 * 60 * 1000;
 const AVATAR_TTL_MISSING_MS = 15 * 60 * 1000;
-const avatarCache = new LRUCache(3000);
-const groupMetadataCache = new LRUCache(1000);
+const avatarCache = new LRUCache(1000);
+const groupMetadataCache = new LRUCache(500, 15 * 60 * 1000);
+const sharedMsgRetryCache = new LRUCache(1000, 60 * 60 * 1000);
 
 async function fetchProfilePicture(targetSock, jid, resolvedPhone = null) {
     if (!targetSock || !jid || isJidIgnored(jid)) {
@@ -496,6 +615,7 @@ setInterval(() => {
     lastForwardedPresence.purgeExpired();
     avatarCache.purgeExpired();
     groupMetadataCache.purgeExpired();
+    sharedMsgRetryCache.purgeExpired();
 }, 5 * 60 * 1000).unref();
 
 /**
@@ -593,23 +713,85 @@ class SessionManager {
         return path.join(sessionsRootDir, `user_${key}`);
     }
 
+    getContactsCachePath(key) {
+        const authFolder = this.getAuthFolder(key);
+        if (!fs.existsSync(authFolder)) {
+            try { fs.mkdirSync(authFolder, { recursive: true }); } catch (_) {}
+        }
+        return path.join(authFolder, 'contacts_cache.json');
+    }
+
+    loadCachedContacts(key) {
+        try {
+            const filePath = this.getContactsCachePath(key);
+            if (fs.existsSync(filePath)) {
+                const raw = fs.readFileSync(filePath, 'utf8');
+                return JSON.parse(raw) || {};
+            }
+        } catch (e) {
+            console.warn(`[user_${key}] Error reading contacts cache:`, e.message);
+        }
+        return {};
+    }
+
+    saveCachedContacts(key, newContacts) {
+        if (!Array.isArray(newContacts) || newContacts.length === 0) return;
+        try {
+            const cache = this.loadCachedContacts(key);
+            let updated = false;
+            for (const c of newContacts) {
+                const id = c?.id || c?.jid;
+                if (!id || isJidIgnored(id) || id.endsWith('@g.us')) continue;
+
+                const existing = cache[id] || {};
+                const name = c.name || existing.name || null;
+                const notify = c.notify || existing.notify || null;
+                const verifiedName = c.verifiedName || existing.verifiedName || null;
+                const imgUrl = c.imgUrl || existing.imgUrl || null;
+
+                cache[id] = {
+                    id,
+                    name,
+                    notify,
+                    verifiedName,
+                    imgUrl,
+                    isGroup: false,
+                    updatedAt: Date.now(),
+                };
+                updated = true;
+            }
+
+            if (updated) {
+                const filePath = this.getContactsCachePath(key);
+                fs.writeFileSync(filePath, JSON.stringify(cache, null, 2), 'utf8');
+            }
+        } catch (e) {
+            console.warn(`[user_${key}] Error saving contacts cache:`, e.message);
+        }
+    }
+
     getSession(userId) {
         const key = this.normalizeKey(userId);
         return this.sessions.get(key) || null;
     }
 
     /**
-     * Find the best socket for sending/actions when user_id is optional:
-     * 1. Exact userId session if requested
-     * 2. Any currently 'connected' user session if no userId was specified
-     * 3. Default session fallback
+     * Find the active socket for sending/actions:
+     * 1. When `userId` is explicitly provided, STRICTLY resolve only that user's connected session
+     *    (never fall back to another agent's or team leader's WhatsApp session).
+     * 2. When `userId` is omitted/null, fall back to `default` or any connected session.
      */
     resolveActiveSession(userId = null) {
         if (userId !== undefined && userId !== null && String(userId).trim() !== '') {
             const session = this.getSession(userId);
-            if (session && session.sock) {
+            if (!session || !session.sock) {
+                return null;
+            }
+            const socketReady = session.sock.ws?.readyState === 1 || isSocketOpen(session.sock);
+            if (session.status === 'connected' || (socketReady && !session.qr)) {
                 return session;
             }
+            return null;
         }
 
         const defaultSession = this.sessions.get('default');
@@ -623,7 +805,7 @@ class SessionManager {
             }
         }
 
-        return defaultSession || this.sessions.values().next().value || null;
+        return null;
     }
 
     notifyWaiters(session) {
@@ -739,8 +921,31 @@ class SessionManager {
                 const sock = makeWASocket({
                     auth: state,
                     printQRInTerminal: false,
-                    syncFullHistory: true,
-                    shouldSyncHistoryMessage: () => true,
+                    syncFullHistory: false,
+                    markOnlineOnConnect: false,
+                    shouldSyncHistoryMessage: (historyMsg) => {
+                        const syncType = historyMsg?.syncType;
+                        // Strictly skip FULL (2) and ON_DEMAND (6) historical archives so Baileys does not decompress 50+ history chunks into memory
+                        if (
+                            syncType === proto?.HistorySync?.HistorySyncType?.FULL ||
+                            syncType === proto?.HistorySync?.HistorySyncType?.ON_DEMAND ||
+                            syncType === 2 ||
+                            syncType === 6
+                        ) {
+                            return false;
+                        }
+                        // Allow lightweight INITIAL_BOOTSTRAP (0), RECENT (3), and PUSH_NAME (4) for contacts & chats
+                        return (
+                            syncType === proto?.HistorySync?.HistorySyncType?.INITIAL_BOOTSTRAP ||
+                            syncType === proto?.HistorySync?.HistorySyncType?.RECENT ||
+                            syncType === proto?.HistorySync?.HistorySyncType?.PUSH_NAME ||
+                            syncType === 0 ||
+                            syncType === 3 ||
+                            syncType === 4
+                        );
+                    },
+                    msgRetryCounterCache: sharedMsgRetryCache,
+                    cachedGroupMetadata: async (jid) => groupMetadataCache.get(jid),
                 });
 
                 if (sock.authState && !sock.authState.state) {
@@ -898,7 +1103,7 @@ class SessionManager {
                         }
                     }
 
-                    if ((content.senderKeyDistributionMessage || msg.message?.senderKeyDistributionMessage) && !content.conversation && !content.extendedTextMessage && !content.imageMessage && !content.videoMessage && !content.audioMessage && !content.documentMessage) {
+                    if ((content.senderKeyDistributionMessage || msg.message?.senderKeyDistributionMessage) && !content.conversation && !content.extendedTextMessage && !content.imageMessage && !content.videoMessage && !content.audioMessage && !content.documentMessage && !content.stickerMessage && !content.contactMessage && !content.contactsArrayMessage) {
                         continue;
                     }
 
@@ -954,7 +1159,7 @@ class SessionManager {
                             event: 'reaction',
                             from: isGroup ? remoteJid : (resolvedPhone || sender),
                             phone: isGroup ? remoteJid : (resolvedPhone || sender),
-                            remoteJid: sender,
+                            remoteJid: remoteJid,
                             resolved_phone: resolvedPhone,
                             isGroup,
                             groupName,
@@ -1027,15 +1232,18 @@ class SessionManager {
                     }
 
                     const mediaInfo = detectIncomingMedia(content);
-                    const text = (
-                        content.conversation ||
-                        content.extendedTextMessage?.text ||
-                        mediaInfo?.node?.caption ||
-                        ''
-                    ).trim();
+                    const contactInfo = !mediaInfo ? extractIncomingContacts(content) : null;
+                    const text = contactInfo
+                        ? JSON.stringify({ type: 'vcard_contacts', contacts: contactInfo.contacts })
+                        : (
+                            content.conversation ||
+                            content.extendedTextMessage?.text ||
+                            mediaInfo?.node?.caption ||
+                            ''
+                        ).trim();
 
-                    // Safety fallback: if extracted text body is empty, dot, or null AND there is no valid media attached, drop entirely
-                    if (!sender || (!mediaInfo && (!text || text === '.' || text === 'null'))) {
+                    // Safety fallback: if extracted text body is empty, dot, or null AND there is no valid media/contact attached, drop entirely
+                    if (!sender || (!mediaInfo && !contactInfo && (!text || text === '.' || text === 'null'))) {
                         continue;
                     }
 
@@ -1045,6 +1253,8 @@ class SessionManager {
                         content?.videoMessage?.contextInfo ||
                         content?.audioMessage?.contextInfo ||
                         content?.documentMessage?.contextInfo ||
+                        content?.stickerMessage?.contextInfo ||
+                        contactInfo?.contextInfo ||
                         content?.contextInfo;
 
                     const quotedWaId = contextInfo?.stanzaId || null;
@@ -1105,13 +1315,22 @@ class SessionManager {
                     };
 
                     if (mediaInfo) {
+                        const isSticker = mediaInfo.mediaType === 'sticker';
                         Object.assign(payload, {
                             mediaType: mediaInfo.mediaType,
-                            mimetype: media?.mimetype || mediaInfo.node.mimetype || null,
-                            fileName: mediaInfo.node.fileName || null,
+                            mimetype: media?.mimetype || mediaInfo.node.mimetype || (isSticker ? 'image/webp' : null),
+                            fileName: mediaInfo.node.fileName || (isSticker ? 'sticker.webp' : null),
                             is_voice_note: mediaInfo.mediaType === 'audio' && !!mediaInfo.node.ptt,
+                            is_animated: isSticker && !!mediaInfo.node.isAnimated,
                             media_base64: media?.base64 || null,
                             media_error: media?.error || null,
+                        });
+                    } else if (contactInfo) {
+                        Object.assign(payload, {
+                            mediaType: 'contact',
+                            mimetype: 'text/vcard',
+                            fileName: contactInfo.displayName,
+                            contacts: contactInfo.contacts,
                         });
                     } else {
                         payload.raw = msg;
@@ -1122,23 +1341,25 @@ class SessionManager {
             }
         });
 
+
         // Sync contacts and names from WhatsApp address book
         sock.ev.on('contacts.upsert', async (rawContacts) => {
             try {
                 const cleanContacts = [];
                 for (const c of (rawContacts || [])) {
                     const jid = c?.id || c?.jid;
-                    if (!jid || isJidIgnored(jid)) continue;
+                    if (!jid || isJidIgnored(jid) || jid.endsWith('@g.us')) continue;
                     cleanContacts.push({
                         id: jid,
-                        name: c.name || c.notify || c.verifiedName || null,
-                        notify: c.notify || null,
+                        name: c.name || null,
+                        notify: c.notify || c.verifiedName || null,
                         verifiedName: c.verifiedName || null,
                         imgUrl: c.imgUrl || null,
-                        isGroup: jid.endsWith('@g.us'),
+                        isGroup: false,
                     });
                 }
                 if (cleanContacts.length > 0) {
+                    this.saveCachedContacts(key, cleanContacts);
                     await forwardToLaravel({
                         event: 'contacts.upsert',
                         contacts: cleanContacts,
@@ -1151,22 +1372,24 @@ class SessionManager {
             }
         });
 
+
         sock.ev.on('contacts.update', async (updates) => {
             try {
                 const cleanUpdates = [];
                 for (const u of (updates || [])) {
                     const jid = u?.id || u?.jid;
-                    if (!jid || isJidIgnored(jid)) continue;
+                    if (!jid || isJidIgnored(jid) || jid.endsWith('@g.us')) continue;
                     cleanUpdates.push({
                         id: jid,
-                        name: u.name || u.notify || u.verifiedName || null,
-                        notify: u.notify || null,
+                        name: u.name || null,
+                        notify: u.notify || u.verifiedName || null,
                         verifiedName: u.verifiedName || null,
                         imgUrl: u.imgUrl || null,
-                        isGroup: jid.endsWith('@g.us'),
+                        isGroup: false,
                     });
                 }
                 if (cleanUpdates.length > 0) {
+                    this.saveCachedContacts(key, cleanUpdates);
                     await forwardToLaravel({
                         event: 'contacts.update',
                         contacts: cleanUpdates,
@@ -1178,6 +1401,7 @@ class SessionManager {
                 console.error(`[${session.sessionId}] Error handling contacts.update:`, err?.message || err);
             }
         });
+
 
         // Delivery / read receipts & reaction updates for messages
         sock.ev.on('messages.update', async (updates) => {
@@ -1199,7 +1423,7 @@ class SessionManager {
                     const latestReaction = reactionsList[reactionsList.length - 1];
                     const emoji = latestReaction?.text || '';
                     const rKey = latestReaction?.key || {};
-                    const isFromMe = Boolean(rKey.fromMe ?? msgKey.fromMe);
+                    const isFromMe = rKey.fromMe !== undefined ? Boolean(rKey.fromMe) : false;
                     const participant = rKey.participant || msgKey.participant || jid;
                     const resolvedPhone = isGroup ? null : await resolvePhoneFromJid(jid, { key: msgKey }, sock, authFolder);
 
@@ -1252,6 +1476,46 @@ class SessionManager {
             }
         });
 
+        // Reactions emitted via messages.reaction in Baileys
+        sock.ev.on('messages.reaction', async (reactions) => {
+            for (const item of (reactions || [])) {
+                const targetKey = item?.key;
+                const reaction = item?.reaction;
+                if (!targetKey?.id) continue;
+
+                const jid = targetKey.remoteJid || reaction?.key?.remoteJid;
+                if (!jid || isJidIgnored(jid)) continue;
+
+                const isGroup = jid.endsWith('@g.us');
+                const emoji = reaction?.text || '';
+                const rKey = reaction?.key || {};
+                const isFromMe = rKey.fromMe !== undefined ? Boolean(rKey.fromMe) : false;
+                const participant = rKey.participant || targetKey.participant || jid;
+                const resolvedPhone = isGroup ? null : await resolvePhoneFromJid(jid, { key: targetKey }, sock, authFolder);
+
+                console.log(`[${session.sessionId}] Reaction (event) for message ${targetKey.id}: "${emoji || '[removed]'}"`);
+
+                await forwardToLaravel({
+                    event: 'reaction',
+                    target_id: targetKey.id,
+                    target_key: targetKey,
+                    emoji,
+                    reactions: [reaction],
+                    remoteJid: jid,
+                    from: isGroup ? jid : (resolvedPhone || jid),
+                    phone: isGroup ? jid : (resolvedPhone || jid),
+                    resolved_phone: resolvedPhone,
+                    participant: isGroup ? participant : (resolvedPhone || jid),
+                    isGroup,
+                    is_from_me: isFromMe,
+                    fromMe: isFromMe,
+                    direction: isFromMe ? 'out' : 'in',
+                    key: rKey.id ? rKey : targetKey,
+                    timestamp: Math.floor(Date.now() / 1000),
+                }, 'reaction (messages.reaction)', 5000, key);
+            }
+        });
+
         // Delivery / read receipts emitted via message-receipt.update in Baileys
         sock.ev.on('message-receipt.update', async (receipts) => {
             for (const item of (receipts || [])) {
@@ -1288,6 +1552,7 @@ class SessionManager {
             }
         });
 
+
         // Online / typing / last seen of contacts subscribed on this user's socket
         sock.ev.on('presence.update', async ({ id, presences }) => {
             if (!id || id === 'status@broadcast' || id.endsWith('@broadcast') || id.endsWith('@newsletter') || id.endsWith('@g.us')) return;
@@ -1316,6 +1581,7 @@ class SessionManager {
             }
         });
 
+
         // WhatsApp History Synchronization (messaging-history.set for initial, full, recent, and ON_DEMAND syncs)
         sock.ev.on('messaging-history.set', async (historyPayload = {}) => {
             try {
@@ -1328,6 +1594,21 @@ class SessionManager {
                     progress,
                     syncType,
                 } = historyPayload;
+
+                const isFullOrOnDemandSync =
+                    syncType === proto?.HistorySync?.HistorySyncType?.FULL ||
+                    syncType === proto?.HistorySync?.HistorySyncType?.ON_DEMAND ||
+                    syncType === 2 ||
+                    syncType === 6 ||
+                    syncType === 'FULL' ||
+                    syncType === 'ON_DEMAND';
+
+                if (isFullOrOnDemandSync) {
+                    console.log(
+                        `[${session.sessionId}] Skipping message extraction for FULL/ON_DEMAND history sync (syncType=${syncType}) to preserve memory. ` +
+                        `Contacts (${contacts.length}) and chats (${chats.length}) will still be safely processed.`
+                    );
+                }
 
                 // Helper: Ignore WhatsApp Statuses (Stories), broadcast lists, and Channels (@newsletter)
                 const isBroadcastOrNewsletter = (jid) => {
@@ -1402,12 +1683,13 @@ class SessionManager {
                     return clean;
                 };
 
-                // 1. Process & filter chats (and collect any messages nested on chat.messages)
+                // 1. Process & filter chats (and collect lightweight recent messages if not full sync)
                 const cleanChats = [];
                 const nestedChatMessages = [];
                 for (const chat of (chats || [])) {
-                    if (Array.isArray(chat?.messages)) {
-                        for (const item of chat.messages) {
+                    if (!isFullOrOnDemandSync && Array.isArray(chat?.messages)) {
+                        const recentSlice = chat.messages.slice(-5);
+                        for (const item of recentSlice) {
                             const m = item?.message || item;
                             if (m && typeof m === 'object') {
                                 nestedChatMessages.push(m);
@@ -1428,34 +1710,54 @@ class SessionManager {
                     });
                 }
 
-                // 2. Process & filter contacts
+                // 2. Process & filter contacts (Always processed to sync phonebook properly)
                 const cleanContacts = [];
                 for (const contact of (contacts || [])) {
                     const rawContactJid = contact?.phoneNumber || contact?.pnJid || contact?.id || contact?.jid;
                     const jid = await normalizeHistoryJid(rawContactJid);
-                    if (!jid) continue;
+                    if (!jid || isJidIgnored(jid) || jid.endsWith('@g.us')) continue;
                     cleanContacts.push({
                         id: jid,
-                        name: contact.name || contact.notify || contact.verifiedName || null,
-                        notify: contact.notify || null,
+                        name: contact.name || null,
+                        notify: contact.notify || contact.verifiedName || null,
                         verifiedName: contact.verifiedName || null,
                         imgUrl: contact.imgUrl || null,
-                        isGroup: jid.endsWith('@g.us'),
+                        isGroup: false,
                     });
                 }
 
-                // 3. Collect ALL messages from payload.messages (and any chat.messages fallback) with NO age/90-day cutoff
+                // 3. Collect bounded messages (strictly capped per chat and total; skipped completely for FULL sync)
                 const allRawMessages = [];
-                const seenRawMsgIds = new Set();
-                for (const candidate of [...(messages || []), ...nestedChatMessages]) {
-                    const msg = candidate?.message && candidate?.key === undefined ? candidate.message : candidate;
-                    if (!msg || typeof msg !== 'object') continue;
-                    const msgId = msg.key?.id;
-                    if (msgId) {
-                        if (seenRawMsgIds.has(msgId)) continue;
-                        seenRawMsgIds.add(msgId);
+                if (!isFullOrOnDemandSync) {
+                    const seenRawMsgIds = new Set();
+                    const messagesPerChat = new Map();
+                    const MAX_MSGS_PER_CHAT = 20; // Only keep up to 20 most recent messages per conversation
+                    const MAX_TOTAL_HISTORY_MSGS = 300; // Hard cap per history sync payload
+
+                    const rawCandidates = [...(messages || []), ...nestedChatMessages];
+                    // Traverse backwards (from newest) to keep the most recent messages
+                    for (let idx = rawCandidates.length - 1; idx >= 0; idx--) {
+                        if (allRawMessages.length >= MAX_TOTAL_HISTORY_MSGS) break;
+
+                        const candidate = rawCandidates[idx];
+                        const msg = candidate?.message && candidate?.key === undefined ? candidate.message : candidate;
+                        if (!msg || typeof msg !== 'object') continue;
+
+                        const msgId = msg.key?.id;
+                        if (msgId) {
+                            if (seenRawMsgIds.has(msgId)) continue;
+                            seenRawMsgIds.add(msgId);
+                        }
+
+                        const rawRemoteJid = msg.key?.remoteJid || msg.remoteJid;
+                        if (rawRemoteJid) {
+                            const count = messagesPerChat.get(rawRemoteJid) || 0;
+                            if (count >= MAX_MSGS_PER_CHAT) continue;
+                            messagesPerChat.set(rawRemoteJid, count + 1);
+                        }
+
+                        allRawMessages.push(msg);
                     }
-                    allRawMessages.push(msg);
                 }
 
                 const extractedMessages = [];
@@ -1485,7 +1787,7 @@ class SessionManager {
                         }
                     }
 
-                    if ((content.senderKeyDistributionMessage || msg.message?.senderKeyDistributionMessage) && !content.conversation && !content.extendedTextMessage && !content.imageMessage && !content.videoMessage && !content.audioMessage && !content.documentMessage) {
+                    if ((content.senderKeyDistributionMessage || msg.message?.senderKeyDistributionMessage) && !content.conversation && !content.extendedTextMessage && !content.imageMessage && !content.videoMessage && !content.audioMessage && !content.documentMessage && !content.stickerMessage && !content.contactMessage && !content.contactsArrayMessage) {
                         continue;
                     }
 
@@ -1503,47 +1805,34 @@ class SessionManager {
                     const ts = toEpochSeconds(msg.messageTimestamp || msg.timestamp);
                     const isFromMe = Boolean(msg.key?.fromMe);
                     const mediaInfo = detectIncomingMedia(content);
+                    const contactInfo = !mediaInfo ? extractIncomingContacts(content) : null;
 
-                    const text = (
-                        content?.conversation ||
-                        content?.extendedTextMessage?.text ||
-                        mediaInfo?.node?.caption ||
-                        ''
-                    ).trim();
+                    const text = contactInfo
+                        ? JSON.stringify({ type: 'vcard_contacts', contacts: contactInfo.contacts })
+                        : (
+                            content?.conversation ||
+                            content?.extendedTextMessage?.text ||
+                            mediaInfo?.node?.caption ||
+                            ''
+                        ).trim();
 
-                    // Safety fallback: if extracted text is empty/dot/null AND there is no media, drop message entirely
-                    if (!mediaInfo && (!text || text === '.' || text === 'null')) continue;
+                    // Safety fallback: if extracted text is empty/dot/null AND there is no media/contact, drop message entirely
+                    if (!mediaInfo && !contactInfo && (!text || text === '.' || text === 'null')) continue;
 
                     let body = text;
-                    let fullMediaBase64 = null;
-                    let thumbnailBase64 = null;
 
-                    if (mediaInfo) {
-                        // Check for jpegThumbnail on the media node
-                        if (mediaInfo.node?.jpegThumbnail) {
-                            try {
-                                const rawThumb = mediaInfo.node.jpegThumbnail;
-                                const thumbBuf = Buffer.isBuffer(rawThumb) ? rawThumb : Buffer.from(rawThumb);
-                                if (thumbBuf.length > 0) {
-                                    thumbnailBase64 = `data:image/jpeg;base64,${thumbBuf.toString('base64')}`;
-                                }
-                            } catch (_) {
-                                thumbnailBase64 = null;
-                            }
-                        }
-
-                        // DO NOT download full media during bulk history sync - causes JavaScript heap out of memory
-                        // Historical media can be downloaded on-demand if requested
-                        if (!body) {
-                            if (mediaInfo.mediaType === 'audio') {
-                                body = '🎤 [Voice Note]';
-                            } else if (mediaInfo.mediaType === 'document') {
-                                body = mediaInfo.node?.fileName ? `📄 [Document: ${mediaInfo.node.fileName}]` : '📄 [Document]';
-                            } else if (mediaInfo.mediaType === 'video') {
-                                body = '🎥 [Video]';
-                            } else {
-                                body = '📷 [Photo]';
-                            }
+                    // Memory safety: NEVER buffer full media or base64 thumbnails during history sync
+                    if (mediaInfo && !body) {
+                        if (mediaInfo.mediaType === 'audio') {
+                            body = '🎤 [Voice Note]';
+                        } else if (mediaInfo.mediaType === 'document') {
+                            body = mediaInfo.node?.fileName ? `📄 [Document: ${mediaInfo.node.fileName}]` : '📄 [Document]';
+                        } else if (mediaInfo.mediaType === 'video') {
+                            body = '🎥 [Video]';
+                        } else if (mediaInfo.mediaType === 'sticker') {
+                            body = '🏷️ [Sticker]';
+                        } else {
+                            body = '📷 [Photo]';
                         }
                     }
 
@@ -1553,6 +1842,7 @@ class SessionManager {
                         content?.videoMessage?.contextInfo ||
                         content?.audioMessage?.contextInfo ||
                         content?.documentMessage?.contextInfo ||
+                        content?.stickerMessage?.contextInfo ||
                         content?.contextInfo;
 
                     const quotedWaId = contextInfo?.stanzaId || null;
@@ -1577,26 +1867,28 @@ class SessionManager {
                         quoted_wa_id: quotedWaId,
                         pushName: (isGroup || isFromMe) ? null : (msg.pushName || null),
                         senderPushName: (isGroup || isFromMe) ? null : (msg.pushName || null),
-                        mediaType: mediaInfo?.mediaType || null,
-                        fileName: mediaInfo?.node?.fileName || null,
-                        mimetype: mediaInfo?.node?.mimetype || null,
-                        fullMediaBase64: fullMediaBase64 || null,
-                        media_base64: fullMediaBase64 || null,
-                        thumbnailBase64: thumbnailBase64 || null,
+                        mediaType: mediaInfo?.mediaType || (contactInfo ? 'contact' : null),
+                        fileName: mediaInfo?.node?.fileName || contactInfo?.displayName || null,
+                        mimetype: mediaInfo?.node?.mimetype || (contactInfo ? 'text/vcard' : null),
+                        contacts: contactInfo?.contacts || null,
+                        fullMediaBase64: null,
+                        media_base64: null,
+                        thumbnailBase64: null,
                         isGroup,
                     });
                 }
 
                 console.log(
                     `[${session.sessionId}] WhatsApp history sync (type=${syncType ?? 'unknown'}): ${cleanChats.length} chats, ` +
-                    `${cleanContacts.length} contacts, ${extractedMessages.length} messages extracted (out of ${allRawMessages.length} total)`
+                    `${cleanContacts.length} contacts, ${extractedMessages.length} messages extracted (out of ${allRawMessages.length} candidates)`
                 );
 
                 // Ensure extractedMessages are strictly sorted ascending chronologically
                 extractedMessages.sort((a, b) => Number(a.messageTimestamp || a.timestamp || 0) - Number(b.messageTimestamp || b.timestamp || 0));
 
-                // 4. Safe Sequential Chunking (50 messages per chunk) to eliminate Payload Too Large and OOM crashes
+                // 4. Safe Sequential Chunking (100 contacts, 50 messages per chunk) to eliminate OOM
                 if (cleanContacts.length > 0) {
+                    this.saveCachedContacts(key, cleanContacts);
                     const CONTACT_CHUNK_SIZE = 100;
                     for (let c = 0; c < cleanContacts.length; c += CONTACT_CHUNK_SIZE) {
                         const contactBatch = cleanContacts.slice(c, c + CONTACT_CHUNK_SIZE);
@@ -1625,7 +1917,7 @@ class SessionManager {
                         total_chunks: 1,
                         is_latest: Boolean(isLatest),
                         sync_type: syncType,
-                    }, 'history_sync (0 messages)', 30000, key);
+                    }, `history_sync (${cleanChats.length} chats, 0 messages)`, 30000, key);
                 } else {
                     const totalChunks = Math.ceil(extractedMessages.length / CHUNK_SIZE);
                     console.log(
@@ -1655,6 +1947,7 @@ class SessionManager {
                 console.error(`[${session.sessionId}] Error handling messaging-history.set:`, historyErr);
             }
         });
+
             } finally {
                 session.initPromise = null;
             }
@@ -2037,6 +2330,60 @@ app.post('/sessions/restart', authenticate, async (req, res) => {
     }
 });
 
+/**
+ * POST /sessions/:userId/sync-contacts or /sessions/sync-contacts
+ * Body: { user_id?: number|string }
+ * Re-pushes cached phonebook contacts for this session to Laravel CRM on demand.
+ */
+app.post(['/sessions/:userId/sync-contacts', '/sessions/sync-contacts', '/api/sync-contacts'], authenticate, async (req, res) => {
+    const rawUserId = req.params.userId || req.body?.user_id || req.query?.user_id || 'default';
+    const key = sessionManager.normalizeKey(rawUserId);
+    const session = sessionManager.getSession(key);
+
+    const cachedMap = sessionManager.loadCachedContacts(key);
+    const allContacts = Object.values(cachedMap);
+
+    const validContacts = allContacts.filter(c => {
+        const jid = c?.id || c?.jid;
+        if (!jid || isJidIgnored(jid) || jid.endsWith('@g.us')) return false;
+        return Boolean(c.name || c.notify);
+    });
+
+    if (validContacts.length === 0) {
+        return res.status(200).json({
+            success: false,
+            count: 0,
+            message: 'No cached contacts found for this session. Please re-link WhatsApp or wait for WhatsApp to sync contacts.',
+        });
+    }
+
+    const sessionId = session?.sessionId || `user_${key}`;
+    const CHUNK_SIZE = 100;
+    let forwardedCount = 0;
+
+    for (let c = 0; c < validContacts.length; c += CHUNK_SIZE) {
+        const batch = validContacts.slice(c, c + CHUNK_SIZE);
+        try {
+            await forwardToLaravel({
+                event: 'contacts.upsert',
+                contacts: batch,
+                user_id: key,
+                session_id: sessionId,
+            }, `manual contacts sync (${c + 1}-${c + batch.length}/${validContacts.length})`, 15000, key);
+            forwardedCount += batch.length;
+        } catch (err) {
+            console.error(`[user_${key}] Failed re-syncing contacts chunk:`, err?.message || err);
+        }
+    }
+
+    return res.status(200).json({
+        success: true,
+        count: forwardedCount,
+        total: validContacts.length,
+        message: `Successfully re-synced ${forwardedCount} contacts to CRM.`,
+    });
+});
+
 // ============================================================================
 // Management & Messaging API Endpoints (User-scoped when `user_id` is passed)
 // ============================================================================
@@ -2233,20 +2580,23 @@ app.post(['/send', '/api/send', '/sessions/send'], authenticate, async (req, res
         file_name,
         is_voice_note,
         quoted_message_key,
+        contact,
+        contacts,
     } = req.body;
 
+    const mediaType = String(media_type || '').toLowerCase();
+    const isContactSend = mediaType === 'contact' || Boolean(contact) || (Array.isArray(contacts) && contacts.length > 0);
     const hasMedia = Boolean(media_url || media_base64);
 
-    if (!phone || (!hasMedia && !message)) {
+    if (!phone || (!hasMedia && !isContactSend && !message)) {
         return res.status(400).json({
             success: false,
-            error: hasMedia
+            error: (hasMedia || isContactSend)
                 ? 'The "phone" field is required.'
-                : 'Both "phone" and "message" fields are required (or provide media_url / media_base64).',
+                : 'Both "phone" and "message" fields are required (or provide media_url / media_base64 / contacts).',
         });
     }
 
-    const mediaType = String(media_type || '').toLowerCase();
     if (hasMedia && !MEDIA_TYPES.includes(mediaType)) {
         return res.status(400).json({
             success: false,
@@ -2267,6 +2617,8 @@ app.post(['/send', '/api/send', '/sessions/send'], authenticate, async (req, res
     if (!sock) {
         return res.status(503).json({
             success: false,
+            code: 'AGENT_WHATSAPP_DISCONNECTED',
+            user_id: user_id ?? null,
             error: user_id
                 ? `WhatsApp session for user ${user_id} is not connected.`
                 : 'No connected WhatsApp session is available.',
@@ -2338,7 +2690,43 @@ app.post(['/send', '/api/send', '/sessions/send'], authenticate, async (req, res
 
         let result = null;
 
-        if (hasMedia) {
+        if (isContactSend) {
+            const rawContactList = Array.isArray(contacts) && contacts.length > 0
+                ? contacts
+                : (contact ? [contact] : []);
+
+            if (rawContactList.length === 0 && message) {
+                try {
+                    const parsedBody = JSON.parse(String(message));
+                    if (Array.isArray(parsedBody?.contacts)) {
+                        rawContactList.push(...parsedBody.contacts);
+                    } else if (parsedBody?.name || parsedBody?.phone) {
+                        rawContactList.push(parsedBody);
+                    }
+                } catch (_) {}
+            }
+
+            const vcardItems = rawContactList
+                .map(c => ({
+                    displayName: String(c?.name || c?.displayName || 'Contact').trim() || 'Contact',
+                    vcard: buildVcardString(c),
+                }))
+                .filter(c => c.vcard);
+
+            if (vcardItems.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'At least one valid contact (name and phone) is required for contact send.',
+                });
+            }
+
+            result = await sock.sendMessage(jid, {
+                contacts: {
+                    displayName: vcardItems[0].displayName,
+                    contacts: vcardItems,
+                },
+            }, sendOptions);
+        } else if (hasMedia) {
             const voiceNote = mediaType === 'audio' && (
                 is_voice_note === true ||
                 is_voice_note === 'true' ||
@@ -2366,13 +2754,17 @@ app.post(['/send', '/api/send', '/sessions/send'], authenticate, async (req, res
 
             const content = { [mediaType]: source };
 
-            if (mediaType === 'audio') {
+            if (mediaType === 'sticker') {
+                content.mimetype = 'image/webp';
+            } else if (mediaType === 'audio') {
                 content.ptt = voiceNote;
-            } else if (message) {
-                content.caption = String(message);
+                content.mimetype = finalMimetype;
+            } else {
+                if (message) {
+                    content.caption = String(message);
+                }
+                content.mimetype = finalMimetype;
             }
-
-            content.mimetype = finalMimetype;
 
             if (mediaType === 'document') {
                 content.fileName = file_name || 'file';
@@ -2380,7 +2772,7 @@ app.post(['/send', '/api/send', '/sessions/send'], authenticate, async (req, res
 
             result = await sock.sendMessage(jid, content, sendOptions);
 
-            if (mediaType === 'audio' && message) {
+            if ((mediaType === 'audio' || mediaType === 'sticker') && message) {
                 await sock.sendMessage(jid, { text: String(message) });
             }
         } else {
