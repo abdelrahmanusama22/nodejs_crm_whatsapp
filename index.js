@@ -1,3 +1,29 @@
+const fs = require('fs');
+const path = require('path');
+
+try {
+    require('dotenv').config({ path: path.join(__dirname, '.env') });
+} catch (_) {
+    const envPath = path.join(__dirname, '.env');
+    if (fs.existsSync(envPath)) {
+        try {
+            const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#')) continue;
+                const eqIdx = trimmed.indexOf('=');
+                if (eqIdx === -1) continue;
+                const k = trimmed.slice(0, eqIdx).trim();
+                const v = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, '');
+                if (k && process.env[k] === undefined) {
+                    process.env[k] = v;
+                }
+            }
+        } catch (_) {}
+    }
+}
+
+const crypto = require('crypto');
 const express = require('express');
 const {
     default: makeWASocket,
@@ -12,8 +38,6 @@ const QRCodeCore = require('qrcode-terminal/vendor/QRCode');
 const QRErrorCorrectLevel = require('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel');
 const axios = require('axios');
 const Redis = require('ioredis');
-const fs = require('fs');
-const path = require('path');
 const { Readable, PassThrough } = require('stream');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
@@ -30,7 +54,8 @@ process.on('unhandledRejection', (reason) => {
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || '127.0.0.1';
 const sessionsRootDir = path.join(__dirname, 'sessions');
 const legacyAuthFolder = path.join(__dirname, 'auth_info_baileys');
 
@@ -53,14 +78,26 @@ if (!fs.existsSync(sessionsRootDir)) {
 }
 
 // ── Security & Gateway Configuration ──
-const API_SECRET = process.env.WHATSAPP_API_SECRET || 'inboxhq-secret-token-2026';
+const API_SECRET = String(process.env.BAILEYS_API_SECRET || process.env.WHATSAPP_API_SECRET || '').trim();
+if (!API_SECRET) {
+    console.warn('[Security] WARNING: BAILEYS_API_SECRET is not set; gateway HTTP API will fail closed (401).');
+}
 
 // ── Authentication Middleware ──
 function authenticate(req, res, next) {
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
 
-    if (!API_SECRET || token !== API_SECRET) {
+    if (!API_SECRET || !token) {
+        return res.status(401).json({
+            success: false,
+            error: 'Unauthorized: Invalid or missing Bearer token.',
+        });
+    }
+
+    const expectedBuf = Buffer.from(API_SECRET, 'utf8');
+    const providedBuf = Buffer.from(token, 'utf8');
+    if (expectedBuf.length !== providedBuf.length || !crypto.timingSafeEqual(expectedBuf, providedBuf)) {
         return res.status(401).json({
             success: false,
             error: 'Unauthorized: Invalid or missing Bearer token.',
@@ -179,7 +216,7 @@ function isSocketOpen(targetSock) {
 // ── Webhook configuration ──
 // Primary transport: Redis list (RPUSH here -> `php artisan wa:redis-listen` BLPOPs it in Laravel).
 // The old HTTP webhook is kept ONLY as a fallback so no event is lost while Redis is unreachable.
-const WA_REDIS_URL = process.env.WA_REDIS_URL || 'redis://127.0.0.1:1980';
+const WA_REDIS_URL = process.env.WA_REDIS_URL || 'redis://127.0.0.1:6379';
 const WA_REDIS_QUEUE = 'wa_webhook_queue';
 
 const redis = new Redis(WA_REDIS_URL, {
@@ -201,12 +238,12 @@ redis.on('error', (err) => {
 redis.on('ready', () => console.log(`[Redis] connected to ${WA_REDIS_URL}`));
 redis.on('end', () => console.warn('[Redis] connection closed'));
 
-const LARAVEL_WEBHOOK_URL = 'http://127.0.0.1/webhooks/baileys';
+const LARAVEL_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhooks/baileys';
+const WEBHOOK_SECRET = String(process.env.BAILEYS_WEBHOOK_SECRET || '').trim();
 const LARAVEL_WEBHOOK_HEADERS = {
-    'Host': 'crm.test',
     'Content-Type': 'application/json',
     'Accept': 'application/json',
-    'X-Webhook-Secret': process.env.BAILEYS_WEBHOOK_SECRET || 'inboxhq-secret-token-2026',
+    ...(WEBHOOK_SECRET ? { 'X-Webhook-Secret': WEBHOOK_SECRET } : {}),
 };
 
 function forwardToLaravel(payload, label = payload.event || 'event', timeout = 4000, userId = null) {
@@ -523,6 +560,14 @@ class LRUCache {
         this.cache.clear();
     }
 
+    flushAll() {
+        this.cache.clear();
+    }
+
+    close() {
+        this.cache.clear();
+    }
+
     get size() {
         return this.cache.size;
     }
@@ -538,9 +583,9 @@ class LRUCache {
 }
 
 // ── Presence & Profile Picture Caches ──
-const PRESENCE_RESUBSCRIBE_MS = 10 * 60 * 1000;
+const PRESENCE_RESUBSCRIBE_MS = 60 * 1000;
 const presenceSubscriptions = new LRUCache(1000, PRESENCE_RESUBSCRIBE_MS);
-const lastForwardedPresence = new LRUCache(1000, 10000);
+const lastForwardedPresence = new LRUCache(1000, 4000);
 
 async function subscribeToPresence(targetSock, jid, userId = 'default') {
     if (!targetSock) return;
@@ -556,10 +601,15 @@ async function subscribeToPresence(targetSock, jid, userId = 'default') {
     }
 }
 
-const isJidIgnored = (jid) => {
+const isStatusOrBroadcastJid = (jid) => {
     if (!jid || typeof jid !== 'string') return true;
     const clean = jid.trim();
-    return clean === 'status@broadcast' || clean.endsWith('@broadcast') || clean.endsWith('@newsletter') || clean.endsWith('@lid');
+    return clean === 'status@broadcast' || clean.endsWith('@broadcast') || clean.endsWith('@newsletter');
+};
+
+const isJidIgnored = (jid) => {
+    if (isStatusOrBroadcastJid(jid)) return true;
+    return jid.trim().endsWith('@lid');
 };
 
 const AVATAR_TTL_FOUND_MS = 60 * 60 * 1000;
@@ -616,6 +666,12 @@ setInterval(() => {
     avatarCache.purgeExpired();
     groupMetadataCache.purgeExpired();
     sharedMsgRetryCache.purgeExpired();
+    if (typeof sessionManager !== 'undefined' && sessionManager?.sessions) {
+        for (const s of sessionManager.sessions.values()) {
+            s.messageCache?.purgeExpired();
+            s.msgRetryCounterCache?.purgeExpired();
+        }
+    }
 }, 5 * 60 * 1000).unref();
 
 /**
@@ -874,11 +930,19 @@ class SessionManager {
                 initPromise: null,
                 waiters: [],
                 startedAt: Date.now(),
+                messageCache: new LRUCache(2000, 12 * 60 * 60 * 1000),
+                msgRetryCounterCache: new LRUCache(1000, 60 * 60 * 1000),
             };
             this.sessions.set(key, session);
         } else {
             session.status = 'connecting';
             session.authFolder = authFolder;
+            if (!session.messageCache) {
+                session.messageCache = new LRUCache(2000, 12 * 60 * 60 * 1000);
+            }
+            if (!session.msgRetryCounterCache) {
+                session.msgRetryCounterCache = new LRUCache(1000, 60 * 60 * 1000);
+            }
         }
 
         const markConnected = (activeSock) => {
@@ -944,9 +1008,28 @@ class SessionManager {
                             syncType === 4
                         );
                     },
-                    msgRetryCounterCache: sharedMsgRetryCache,
-                    cachedGroupMetadata: async (jid) => groupMetadataCache.get(jid),
+                    msgRetryCounterCache: session.msgRetryCounterCache,
+                    retryRequestDelayMs: 250,
+                    maxMsgRetryCount: 5,
+                    enableAutoSessionRecreation: true,
+                    enableRecentMessageCache: true,
+                    getMessage: async (msgKey) => {
+                        if (!msgKey?.id || !session.messageCache) return undefined;
+                        return session.messageCache.get(String(msgKey.id));
+                    },
+                    cachedGroupMetadata: async (jid) => groupMetadataCache.get(`${key}:${jid}`),
                 });
+
+                if (typeof sock.sendMessage === 'function') {
+                    const origSendMessage = sock.sendMessage.bind(sock);
+                    sock.sendMessage = async (...args) => {
+                        const sent = await origSendMessage(...args);
+                        if (sent?.key?.id && sent?.message && session.messageCache) {
+                            session.messageCache.set(String(sent.key.id), sent.message);
+                        }
+                        return sent;
+                    };
+                }
 
                 if (sock.authState && !sock.authState.state) {
                     sock.authState.state = state;
@@ -1078,8 +1161,28 @@ class SessionManager {
                     if (session.status !== 'connected' && (!session.sock || session.sock === sock)) {
                         markConnected(sock);
                     }
-                    for (const msg of event.messages) {
-                if (msg.message) {
+                    const upsertType = event?.type || 'notify';
+                    if (upsertType !== 'notify' && upsertType !== 'append') {
+                        return;
+                    }
+                    const incomingMessages = Array.isArray(event?.messages) ? event.messages : [];
+                    if (upsertType === 'append' && incomingMessages.length > 0) {
+                        console.log(`[${session.sessionId}] Processing offline/catch-up messages.upsert (type=append, count=${incomingMessages.length})`);
+                    }
+
+                    for (const msg of incomingMessages) {
+                        try {
+                            if (msg?.key?.id && msg?.message && session.messageCache) {
+                                session.messageCache.set(String(msg.key.id), msg.message);
+                            }
+
+                            if (!msg?.message) {
+                                if (msg?.messageStubType === 2 || msg?.messageStubType === proto?.WebMessageInfo?.StubType?.CIPHERTEXT) {
+                                    console.warn(`[${session.sessionId}] CIPHERTEXT stub for ${msg?.key?.remoteJid} (id=${msg?.key?.id}, participant=${msg?.key?.participant || 'N/A'}) - waiting for Baileys Signal retry`);
+                                }
+                                continue;
+                            }
+
                     const content = normalizeMessageContent(msg.message) || msg.message || {};
                     const msgType = Object.keys(content || {})[0] || Object.keys(msg.message || {})[0];
 
@@ -1103,7 +1206,23 @@ class SessionManager {
                         }
                     }
 
-                    if ((content.senderKeyDistributionMessage || msg.message?.senderKeyDistributionMessage) && !content.conversation && !content.extendedTextMessage && !content.imageMessage && !content.videoMessage && !content.audioMessage && !content.documentMessage && !content.stickerMessage && !content.contactMessage && !content.contactsArrayMessage) {
+                    if (
+                        (content.senderKeyDistributionMessage || msg.message?.senderKeyDistributionMessage) &&
+                        !content.conversation &&
+                        !content.extendedTextMessage &&
+                        !content.imageMessage &&
+                        !content.videoMessage &&
+                        !content.audioMessage &&
+                        !content.documentMessage &&
+                        !content.stickerMessage &&
+                        !content.contactMessage &&
+                        !content.contactsArrayMessage &&
+                        !content.reactionMessage &&
+                        !content.protocolMessage &&
+                        !content.locationMessage &&
+                        !content.pollCreationMessage &&
+                        !content.pollUpdateMessage
+                    ) {
                         continue;
                     }
 
@@ -1129,15 +1248,20 @@ class SessionManager {
                             if (pDigits) participant = `+${pDigits}`;
                         }
 
-                        const cachedGroupName = groupMetadataCache.get(remoteJid);
-                        if (cachedGroupName) {
-                            groupName = cachedGroupName;
+                        const groupCacheKey = `${key}:${remoteJid}`;
+                        const cachedGroupMeta = groupMetadataCache.get(groupCacheKey);
+                        if (cachedGroupMeta?.subject) {
+                            groupName = cachedGroupMeta.subject;
                         } else {
                             try {
                                 const metadata = await withTimeout(sock.groupMetadata(remoteJid), 4000);
                                 groupName = metadata?.subject || 'WhatsApp Group';
-                                if (metadata?.subject) {
-                                    groupMetadataCache.set(remoteJid, metadata.subject, 15 * 60 * 1000);
+                                if (metadata) {
+                                    groupMetadataCache.set(groupCacheKey, {
+                                        id: metadata.id || remoteJid,
+                                        subject: groupName,
+                                        participants: metadata.participants || [],
+                                    }, 15 * 60 * 1000);
                                 }
                             } catch (err) {
                                 console.error('Failed to fetch group metadata', err.message || err);
@@ -1160,10 +1284,12 @@ class SessionManager {
                             from: isGroup ? remoteJid : (resolvedPhone || sender),
                             phone: isGroup ? remoteJid : (resolvedPhone || sender),
                             remoteJid: remoteJid,
+                            senderJid: isGroup ? (msg.key?.participant || participant) : sender,
                             resolved_phone: resolvedPhone,
                             isGroup,
                             groupName,
                             participant: isGroup ? participant : (resolvedPhone || sender),
+                            targetMessageId: targetKey?.id || null,
                             target_id: targetKey?.id || null,
                             target_key: targetKey || null,
                             emoji,
@@ -1337,7 +1463,24 @@ class SessionManager {
                     }
 
                     await forwardToLaravel(payload, mediaInfo ? 'media message' : 'messages.upsert', mediaInfo ? 30000 : 5000, key);
+                        } catch (msgErr) {
+                            console.error(`[${session.sessionId}] Error processing upserted message ${msg?.key?.id || ''}:`, msgErr?.message || msgErr);
+                        }
+                    }
+                });
+
+        // Invalidate cached group metadata when group subject or participants change
+        sock.ev.on('groups.update', (updates) => {
+            for (const g of (updates || [])) {
+                if (g?.id) {
+                    groupMetadataCache.del(`${key}:${g.id}`);
                 }
+            }
+        });
+
+        sock.ev.on('group-participants.update', ({ id }) => {
+            if (id) {
+                groupMetadataCache.del(`${key}:${id}`);
             }
         });
 
@@ -1411,7 +1554,7 @@ class SessionManager {
                 }
 
                 const jid = msgKey.remoteJid;
-                if (!jid || isJidIgnored(jid)) {
+                if (!jid || isStatusOrBroadcastJid(jid)) {
                     continue;
                 }
 
@@ -1431,11 +1574,13 @@ class SessionManager {
 
                     await forwardToLaravel({
                         event: 'reaction',
+                        targetMessageId: msgKey.id,
                         target_id: msgKey.id,
                         target_key: msgKey,
                         emoji,
                         reactions: reactionsList,
                         remoteJid: jid,
+                        senderJid: rKey.participant || rKey.remoteJid || msgKey.participant || jid,
                         from: isGroup ? jid : (resolvedPhone || jid),
                         phone: isGroup ? jid : (resolvedPhone || jid),
                         resolved_phone: resolvedPhone,
@@ -1451,7 +1596,7 @@ class SessionManager {
                 }
 
                 // 2. Receipts: status updates for outbound messages
-                if (!msgKey.fromMe || update.status === undefined || update.status === null) {
+                if (msgKey.fromMe === false || update.status === undefined || update.status === null) {
                     continue;
                 }
 
@@ -1464,6 +1609,7 @@ class SessionManager {
                 await forwardToLaravel({
                     event: 'message.status',
                     id: msgKey.id,
+                    wa_message_id: msgKey.id,
                     status,
                     remoteJid: jid,
                     from: isGroup ? jid : (resolvedPhone || jid),
@@ -1484,7 +1630,7 @@ class SessionManager {
                 if (!targetKey?.id) continue;
 
                 const jid = targetKey.remoteJid || reaction?.key?.remoteJid;
-                if (!jid || isJidIgnored(jid)) continue;
+                if (!jid || isStatusOrBroadcastJid(jid)) continue;
 
                 const isGroup = jid.endsWith('@g.us');
                 const emoji = reaction?.text || '';
@@ -1497,11 +1643,13 @@ class SessionManager {
 
                 await forwardToLaravel({
                     event: 'reaction',
+                    targetMessageId: targetKey.id,
                     target_id: targetKey.id,
                     target_key: targetKey,
                     emoji,
                     reactions: [reaction],
                     remoteJid: jid,
+                    senderJid: rKey.participant || rKey.remoteJid || targetKey.participant || jid,
                     from: isGroup ? jid : (resolvedPhone || jid),
                     phone: isGroup ? jid : (resolvedPhone || jid),
                     resolved_phone: resolvedPhone,
@@ -1529,7 +1677,7 @@ class SessionManager {
                 }
 
                 let status = 'delivered';
-                if (receipt?.readTimestamp) {
+                if (receipt?.readTimestamp || receipt?.playedTimestamp) {
                     status = 'read';
                 }
 
@@ -1540,6 +1688,7 @@ class SessionManager {
                 await forwardToLaravel({
                     event: 'message.status',
                     id: msgKey.id,
+                    wa_message_id: msgKey.id,
                     status,
                     remoteJid: jid,
                     from: isGroup ? jid : (resolvedPhone || jid),
@@ -1547,7 +1696,7 @@ class SessionManager {
                     resolved_phone: resolvedPhone,
                     isGroup,
                     key: msgKey,
-                    timestamp: toEpochSeconds(receipt?.readTimestamp || receipt?.receiptTimestamp || Date.now()),
+                    timestamp: toEpochSeconds(receipt?.playedTimestamp || receipt?.readTimestamp || receipt?.receiptTimestamp || Date.now()),
                 }, 'message receipt', 5000, key);
             }
         });
@@ -1563,19 +1712,23 @@ class SessionManager {
 
                 const dedupeKey = `${key}:${jid}`;
                 const last = lastForwardedPresence.get(dedupeKey);
-                if (last && last.presence === presence && Date.now() - last.at < 10000) continue;
+                const minAgeMs = (presence === 'composing' || presence === 'recording') ? 4000 : 8000;
+                if (last && last.presence === presence && Date.now() - last.at < minAgeMs) continue;
                 lastForwardedPresence.set(dedupeKey, { presence, at: Date.now() });
 
                 const resolvedPhone = await resolvePhoneFromJid(jid, null, sock, authFolder);
+                const lastSeenVal = data.lastSeen ? toEpochSeconds(data.lastSeen) : null;
 
                 await forwardToLaravel({
                     event: 'presence',
-                    remoteJid: jid,
+                    remoteJid: id || jid,
+                    participant: resolvedPhone || jid,
                     from: resolvedPhone || jid,
                     phone: resolvedPhone || jid,
                     resolved_phone: resolvedPhone,
                     presence,
-                    last_seen: data.lastSeen ? toEpochSeconds(data.lastSeen) : null,
+                    lastSeen: lastSeenVal,
+                    last_seen: lastSeenVal,
                     timestamp: Math.floor(Date.now() / 1000),
                 }, 'presence', 5000, key);
             }
@@ -2777,10 +2930,10 @@ app.post(['/send', '/api/send', '/sessions/send'], authenticate, async (req, res
             }
         } else {
             try {
-                result = await withTimeout(sock.sendMessage(jid, { text: String(message) }, sendOptions), 3500);
+                result = await withTimeout(sock.sendMessage(jid, { text: String(message) }, sendOptions), 8000);
             } catch (sendErr) {
                 if (sendErr.message === 'timeout') {
-                    console.warn(`[${activeSession.sessionId}] sock.sendMessage ACK took >3.5s for ${jid}; returning immediate success.`);
+                    console.warn(`[${activeSession.sessionId}] sock.sendMessage ACK took >8s for ${jid}; returning immediate success.`);
                     result = { key: { id: `BAILEYS_${Date.now()}`, remoteJid: jid, fromMe: true } };
                 } else {
                     throw sendErr;
@@ -3068,6 +3221,44 @@ app.post('/read', authenticate, async (req, res) => {
     }
 });
 
+// POST /presence/subscribe endpoint
+app.post('/presence/subscribe', authenticate, async (req, res) => {
+    const { user_id, sessionId, jid } = req.body || {};
+    const resolvedUserId = user_id ?? (sessionId ? String(sessionId).replace(/^user_/, '') : null);
+    const activeSession = sessionManager.resolveActiveSession(resolvedUserId);
+    const sock = activeSession?.sock;
+
+    if (!sock) {
+        return res.status(200).json({
+            success: false,
+            subscribed: false,
+            reason: 'WhatsApp socket is not connected.',
+        });
+    }
+
+    const rawJid = jid ? String(jid).trim() : '';
+    const targetJid = rawJid
+        ? (rawJid.includes('@') ? rawJid : `${rawPhoneToDigits(rawJid)}@s.whatsapp.net`)
+        : '';
+
+    if (!targetJid || isStatusOrBroadcastJid(targetJid) || targetJid.endsWith('@g.us')) {
+        return res.status(200).json({
+            success: false,
+            subscribed: false,
+            reason: 'Invalid or group JID.',
+        });
+    }
+
+    const key = activeSession.userId || 'default';
+    subscribeToPresence(sock, targetJid, key).catch(() => {});
+
+    return res.status(200).json({
+        success: true,
+        subscribed: true,
+        jid: targetJid,
+    });
+});
+
 function rawPhoneToDigits(phone) {
     return String(phone || '').replace(/\D/g, '');
 }
@@ -3076,8 +3267,8 @@ function rawPhoneToDigits(phone) {
 authStore.init()
     .then((savedSessions) => {
         console.log(`[AuthState] MySQL auth store ready (${savedSessions.length} saved session(s)).`);
-        app.listen(PORT, () => {
-            console.log(`WhatsApp Multi-Session gateway service running on http://localhost:${PORT}`);
+        app.listen(PORT, HOST, () => {
+            console.log(`WhatsApp Multi-Session gateway service running on http://${HOST}:${PORT}`);
             sessionManager.restoreExistingSessions();
         });
     })
